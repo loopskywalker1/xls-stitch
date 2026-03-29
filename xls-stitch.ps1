@@ -24,6 +24,12 @@
 .PARAMETER FilePattern
     Optional. Glob for input files. Default: *.xlsx
 
+.PARAMETER SkipNameNormalization
+    Optional switch. By default, sheet names are normalized so that variants
+    differing only in whitespace around dashes are merged (e.g. "Report - OT",
+    "Report -OT", and "Report-OT" are treated as the same sheet). Use this
+    switch to disable normalization and treat each variant as a separate sheet.
+
 .EXAMPLE
     .\Stitch-ExcelSheets.ps1 -FolderPath "C:\Data\Monthly Reports"
 
@@ -32,6 +38,9 @@
 
 .EXAMPLE
     .\Stitch-ExcelSheets.ps1 -FolderPath "C:\Data\Monthly Reports" -OutputPath "D:\Consolidated" -FilePattern "*.xlsx"
+
+.EXAMPLE
+    .\Stitch-ExcelSheets.ps1 -FolderPath "C:\Data\Monthly Reports" -SkipNameNormalization
 #>
 
 [CmdletBinding()]
@@ -47,8 +56,24 @@ param(
     [string[]]$SheetNames = @(),
 
     [Parameter(Mandatory = $false, HelpMessage = "Glob pattern for matching input files.")]
-    [string]$FilePattern = "*.xlsx"
+    [string]$FilePattern = "*.xlsx",
+
+    [Parameter(Mandatory = $false, HelpMessage = "Disable sheet name normalization (whitespace around dashes).")]
+    [switch]$SkipNameNormalization
 )
+
+# ============================================================================
+# Helper: Normalize sheet name (collapse whitespace around dashes)
+# ============================================================================
+
+function Get-NormalizedSheetName {
+    param([string]$Name)
+    # Collapse any whitespace around dashes/hyphens to " - "
+    $normalized = $Name -replace '\s*-\s*', ' - '
+    # Collapse multiple consecutive spaces to single space
+    $normalized = $normalized -replace '\s+', ' '
+    return $normalized.Trim()
+}
 
 # ============================================================================
 # Phase 0: Prerequisites & Setup
@@ -104,8 +129,10 @@ Write-Host "  $FolderPath`n" -ForegroundColor Cyan
 
 Write-Host "Discovering sheets across all workbooks..." -ForegroundColor Cyan
 
+# $fileSheetMap: filePath -> array of raw sheet names in that file
 $fileSheetMap = @{}
-$allDiscoveredSheets = [System.Collections.Generic.HashSet[string]]::new(
+# $allRawSheets: set of every raw sheet name encountered
+$allRawSheets = [System.Collections.Generic.HashSet[string]]::new(
     [System.StringComparer]::OrdinalIgnoreCase
 )
 $skippedFiles = [System.Collections.Generic.List[string]]::new()
@@ -116,7 +143,7 @@ foreach ($file in $excelFiles) {
         $names = $sheetInfoList | ForEach-Object { $_.Name }
         $fileSheetMap[$file.FullName] = $names
         foreach ($name in $names) {
-            $allDiscoveredSheets.Add($name) | Out-Null
+            $allRawSheets.Add($name) | Out-Null
         }
     }
     catch {
@@ -125,11 +152,62 @@ foreach ($file in $excelFiles) {
     }
 }
 
+# Build normalized-name mapping: canonical name -> list of raw variants
+# When normalization is off, each raw name maps to itself
+$normalizedMap = @{}
+foreach ($rawName in $allRawSheets) {
+    if ($SkipNameNormalization) {
+        $canonical = $rawName
+    }
+    else {
+        $canonical = Get-NormalizedSheetName $rawName
+    }
+    if (-not $normalizedMap.ContainsKey($canonical)) {
+        $normalizedMap[$canonical] = @{
+            CanonicalName = $canonical
+            RawVariants   = [System.Collections.Generic.List[string]]::new()
+        }
+    }
+    $normalizedMap[$canonical].RawVariants.Add($rawName)
+}
+
+# Log normalization merges
+if (-not $SkipNameNormalization) {
+    $mergedCount = 0
+    foreach ($entry in $normalizedMap.Values) {
+        if ($entry.RawVariants.Count -gt 1) {
+            $mergedCount++
+            Write-Host "  Merging variants into '$($entry.CanonicalName)':" -ForegroundColor Yellow
+            foreach ($v in $entry.RawVariants) {
+                Write-Host "    - '$v'" -ForegroundColor White
+            }
+        }
+    }
+    if ($mergedCount -gt 0) {
+        Write-Host "  ($mergedCount sheet name group(s) merged by normalization)" -ForegroundColor Yellow
+        Write-Host ""
+    }
+}
+
+# Build the set of canonical sheet names for target selection
+$allDiscoveredSheets = [System.Collections.Generic.HashSet[string]]::new(
+    [System.StringComparer]::OrdinalIgnoreCase
+)
+foreach ($entry in $normalizedMap.Values) {
+    $allDiscoveredSheets.Add($entry.CanonicalName) | Out-Null
+}
+
 # Determine target sheets
 if ($SheetNames.Count -gt 0) {
-    $targetSheets = $SheetNames
+    # Normalize user-specified names too (unless skipped)
+    if ($SkipNameNormalization) {
+        $targetSheets = $SheetNames
+    }
+    else {
+        $targetSheets = $SheetNames | ForEach-Object { Get-NormalizedSheetName $_ } | Select-Object -Unique
+    }
     Write-Host "Processing specified sheets: $($targetSheets -join ', ')" -ForegroundColor Cyan
-    foreach ($requested in $SheetNames) {
+    foreach ($requested in $targetSheets) {
         if (-not $allDiscoveredSheets.Contains($requested)) {
             Write-Warning "Requested sheet '$requested' was not found in any workbook."
         }
@@ -164,47 +242,72 @@ foreach ($sheetName in $targetSheets) {
     $allColumnNames = [System.Collections.Generic.List[string]]::new()
     $filesProcessedForSheet = 0
 
+    # Look up all raw variant names for this canonical sheet name
+    $rawVariants = @()
+    if ($normalizedMap.ContainsKey($sheetName)) {
+        $rawVariants = $normalizedMap[$sheetName].RawVariants
+    }
+
     foreach ($file in $excelFiles) {
-        # Check if this file has the target sheet
+        # Skip files that failed during discovery (not in $fileSheetMap)
         $sheetsInFile = $fileSheetMap[$file.FullName]
-        if ($null -eq $sheetsInFile -or $sheetName -notin $sheetsInFile) {
+        if ($null -eq $sheetsInFile) {
+            continue
+        }
+
+        # Find ALL matching variant tabs in this file (not just the first)
+        $matchedVariants = [System.Collections.Generic.List[string]]::new()
+        foreach ($variant in $rawVariants) {
+            if ($variant -in $sheetsInFile) {
+                $matchedVariants.Add($variant)
+            }
+        }
+        if ($matchedVariants.Count -eq 0) {
             Write-Verbose "  '$($file.Name)' does not contain sheet '$sheetName'. Skipping."
             continue
         }
 
-        try {
-            $sheetData = Import-Excel -Path $file.FullName -WorksheetName $sheetName -ErrorAction Stop
+        if ($matchedVariants.Count -gt 1) {
+            Write-Warning "  '$($file.Name)' contains $($matchedVariants.Count) variant tabs for '$sheetName': $($matchedVariants -join ', '). Importing all."
+        }
 
-            # Handle empty sheet
-            if ($null -eq $sheetData -or @($sheetData).Count -eq 0) {
-                Write-Verbose "  '$($file.Name)' sheet '$sheetName' is empty. Skipping."
+        # Import each matched variant tab from this file
+        foreach ($matchedVariant in $matchedVariants) {
+            try {
+                $sheetData = Import-Excel -Path $file.FullName -WorksheetName $matchedVariant -ErrorAction Stop
+
+                # Handle empty sheet
+                if ($null -eq $sheetData -or @($sheetData).Count -eq 0) {
+                    Write-Verbose "  '$($file.Name)' sheet '$matchedVariant' is empty. Skipping."
+                    continue
+                }
+
+                # Ensure sheetData is always an array (single-row sheets return a single object)
+                $sheetData = @($sheetData)
+
+                # Derive "Month Year" from filename
+                $monthLabel = [System.IO.Path]::GetFileNameWithoutExtension($file.Name)
+
+                # Add "Month Year" to each row, collect column names from ALL rows (not just first)
+                foreach ($row in $sheetData) {
+                    foreach ($col in $row.PSObject.Properties.Name) {
+                        if ($allColumnNamesSet.Add($col)) {
+                            $allColumnNames.Add($col)
+                        }
+                    }
+                    $row | Add-Member -NotePropertyName "Month Year" -NotePropertyValue $monthLabel -Force
+                    $allRows.Add($row)
+                }
+
+                Write-Host "  Imported $($sheetData.Count) rows from '$($file.Name)' [tab: '$matchedVariant']" -ForegroundColor Green
+            }
+            catch {
+                Write-Warning "  Error reading tab '$matchedVariant' from '$($file.Name)': $_"
                 continue
             }
-
-            # Ensure sheetData is always an array (single-row sheets return a single object)
-            $sheetData = @($sheetData)
-
-            # Derive "Month Year" from filename
-            $monthLabel = [System.IO.Path]::GetFileNameWithoutExtension($file.Name)
-
-            # Add "Month Year" to each row, collect column names from ALL rows (not just first)
-            foreach ($row in $sheetData) {
-                foreach ($col in $row.PSObject.Properties.Name) {
-                    if ($allColumnNamesSet.Add($col)) {
-                        $allColumnNames.Add($col)
-                    }
-                }
-                $row | Add-Member -NotePropertyName "Month Year" -NotePropertyValue $monthLabel -Force
-                $allRows.Add($row)
-            }
-
-            $filesProcessedForSheet++
-            Write-Host "  Imported $($sheetData.Count) rows from '$($file.Name)'" -ForegroundColor Green
         }
-        catch {
-            Write-Warning "  Error reading sheet '$sheetName' from '$($file.Name)': $_"
-            continue
-        }
+
+        $filesProcessedForSheet++
     }
 
     # Skip if no data collected
@@ -251,14 +354,14 @@ foreach ($sheetName in $targetSheets) {
 
     # Handle collision: if two sheet names sanitize to the same filename, append suffix
     $baseOutputName = "$safeSheetName All Months"
-    if ($usedOutputNames.ContainsKey($baseOutputName.ToLower())) {
-        $counter = $usedOutputNames[$baseOutputName.ToLower()] + 1
-        $usedOutputNames[$baseOutputName.ToLower()] = $counter
+    if ($usedOutputNames.ContainsKey($baseOutputName)) {
+        $counter = $usedOutputNames[$baseOutputName] + 1
+        $usedOutputNames[$baseOutputName] = $counter
         $outputFileName = "$baseOutputName ($counter).xlsx"
         Write-Warning "  Output name collision detected for '$sheetName'. Saving as '$outputFileName'."
     }
     else {
-        $usedOutputNames[$baseOutputName.ToLower()] = 1
+        $usedOutputNames[$baseOutputName] = 1
         $outputFileName = "$baseOutputName.xlsx"
     }
     $outputFile = Join-Path $OutputPath $outputFileName
