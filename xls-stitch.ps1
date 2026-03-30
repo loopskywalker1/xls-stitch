@@ -24,6 +24,15 @@
 .PARAMETER FilePattern
     Optional. Glob for input files. Default: *.xlsx
 
+.PARAMETER ExcludeSheetNames
+    Optional. Array of sheet names to exclude from processing. Applied after
+    auto-discovery or -SheetNames filtering. Supports name normalization
+    (dash-whitespace variants are matched unless -SkipNameNormalization is set).
+
+.PARAMETER MaxHeaderRow
+    Optional. Maximum row number to search for valid headers when a sheet has
+    no headers on row 1 or has duplicate headers. Default: 5.
+
 .PARAMETER SkipNameNormalization
     Optional switch. By default, sheet names are normalized so that variants
     differing only in whitespace around dashes are merged (e.g. "Report - OT",
@@ -37,7 +46,10 @@
     .\Stitch-ExcelSheets.ps1 -FolderPath "C:\Data\Monthly Reports" -SheetNames "Sheet1","Sheet2"
 
 .EXAMPLE
-    .\Stitch-ExcelSheets.ps1 -FolderPath "C:\Data\Monthly Reports" -OutputPath "D:\Consolidated" -FilePattern "*.xlsx"
+    .\Stitch-ExcelSheets.ps1 -FolderPath "C:\Data\Monthly Reports" -ExcludeSheetNames "Sheet3","Sheet4"
+
+.EXAMPLE
+    .\Stitch-ExcelSheets.ps1 -FolderPath "C:\Data\Monthly Reports" -OutputPath "D:\Consolidated" -MaxHeaderRow 10
 
 .EXAMPLE
     .\Stitch-ExcelSheets.ps1 -FolderPath "C:\Data\Monthly Reports" -SkipNameNormalization
@@ -57,6 +69,13 @@ param(
 
     [Parameter(Mandatory = $false, HelpMessage = "Glob pattern for matching input files.")]
     [string]$FilePattern = "*.xlsx",
+
+    [Parameter(Mandatory = $false, HelpMessage = "Sheet names to exclude from processing.")]
+    [string[]]$ExcludeSheetNames = @(),
+
+    [Parameter(Mandatory = $false, HelpMessage = "Maximum row to search for valid headers (for sheets with missing or duplicate headers).")]
+    [ValidateRange(1, 100)]
+    [int]$MaxHeaderRow = 5,
 
     [Parameter(Mandatory = $false, HelpMessage = "Disable sheet name normalization (whitespace around dashes).")]
     [switch]$SkipNameNormalization
@@ -83,24 +102,35 @@ function Import-ExcelWithFallback {
     param(
         [string]$Path,
         [string]$WorksheetName,
-        [int]$MaxStartRow = 5
+        [int]$MaxStartRow = 5,
+        [switch]$ForceDedupHeaders
     )
 
-    # Attempt 1: Normal import
-    try {
-        $data = Import-Excel -Path $Path -WorksheetName $WorksheetName -ErrorAction Stop
-        return @{ Data = $data; Strategy = "normal" }
-    }
-    catch {
-        $caughtError = $_
-        $errorMsg = $_.Exception.Message
-    }
+    $isDuplicate = $false
+    $isNoHeaders = $false
+    $errorMsg = ""
 
-    $isDuplicate = $errorMsg -match "Duplicate column headers"
-    $isNoHeaders = $errorMsg -match "No column headers found"
+    if (-not $ForceDedupHeaders) {
+        # Attempt 1: Normal import
+        try {
+            $data = Import-Excel -Path $Path -WorksheetName $WorksheetName -ErrorAction Stop
+            return @{ Data = $data; Strategy = "normal" }
+        }
+        catch {
+            $caughtError = $_
+            $errorMsg = $_.Exception.Message
+        }
 
-    if (-not $isDuplicate -and -not $isNoHeaders) {
-        throw $caughtError
+        $isDuplicate = $errorMsg -match "Duplicate column headers"
+        $isNoHeaders = $errorMsg -match "No column headers found"
+
+        if (-not $isDuplicate -and -not $isNoHeaders) {
+            throw $caughtError
+        }
+    }
+    else {
+        # Forced dedup: skip normal import, go straight to raw-import with dedup
+        $isDuplicate = $true
     }
 
     # Attempt 2: Try increasing StartRow values (headers may not be on row 1)
@@ -377,6 +407,82 @@ else {
     }
 }
 
+# Apply exclusions
+if ($ExcludeSheetNames.Count -gt 0) {
+    if ($SkipNameNormalization) {
+        $normalizedExclusions = $ExcludeSheetNames
+    }
+    else {
+        $normalizedExclusions = $ExcludeSheetNames | ForEach-Object { Get-NormalizedSheetName $_ } | Select-Object -Unique
+    }
+    $beforeCount = @($targetSheets).Count
+    $targetSheets = @($targetSheets | Where-Object { $_ -notin $normalizedExclusions })
+    $excludedCount = $beforeCount - @($targetSheets).Count
+    if ($excludedCount -gt 0) {
+        Write-Host "[EXCLUDE] Excluded $excludedCount sheet(s) from processing: $($normalizedExclusions -join ', ')" -ForegroundColor Yellow
+    }
+    else {
+        Write-Host "[EXCLUDE] None of the specified exclusions matched discovered sheets: $($normalizedExclusions -join ', ')" -ForegroundColor DarkYellow
+    }
+}
+
+if (@($targetSheets).Count -eq 0) {
+    Write-Warning "No sheets to process after applying filters/exclusions."
+    exit 0
+}
+
+Write-Host ""
+
+# ============================================================================
+# Phase 1.5: Pre-scan for sheets with duplicate headers
+# ============================================================================
+
+Write-Host "Pre-scanning for duplicate column headers..." -ForegroundColor Cyan
+
+$sheetsWithDuplicates = [System.Collections.Generic.HashSet[string]]::new(
+    [System.StringComparer]::OrdinalIgnoreCase
+)
+
+foreach ($sheetName in $targetSheets) {
+    if ($sheetsWithDuplicates.Contains($sheetName)) { continue }
+
+    $rawVariants = @()
+    if ($normalizedMap.ContainsKey($sheetName)) {
+        $rawVariants = $normalizedMap[$sheetName].RawVariants
+    }
+
+    # Scan ALL files for this sheet — if ANY file has duplicate headers, flag the sheet
+    foreach ($file in $excelFiles) {
+        $sheetsInFile = $fileSheetMap[$file.FullName]
+        if ($null -eq $sheetsInFile) { continue }
+
+        $testVariant = $null
+        foreach ($variant in $rawVariants) {
+            if ($variant -in $sheetsInFile) {
+                $testVariant = $variant
+                break
+            }
+        }
+        if ($null -eq $testVariant) { continue }
+
+        # Try a normal import — only reading header row is enough to detect duplicates
+        try {
+            $null = Import-Excel -Path $file.FullName -WorksheetName $testVariant -EndRow 1 -ErrorAction Stop
+        }
+        catch {
+            if ($_.Exception.Message -match "Duplicate column headers") {
+                $sheetsWithDuplicates.Add($sheetName) | Out-Null
+                Write-Host "  [DUPLICATE HEADERS] Sheet '$sheetName': Duplicate column names found in '$($file.Name)'. All files will use positional dedup (1st = original, 2nd = _2, etc.) for consistent cross-month matching." -ForegroundColor Yellow
+                break
+            }
+            # Non-duplicate errors (e.g., no headers) — continue checking other files
+        }
+    }
+}
+
+if ($sheetsWithDuplicates.Count -eq 0) {
+    Write-Host "  No duplicate headers detected." -ForegroundColor DarkGray
+}
 Write-Host ""
 
 # ============================================================================
@@ -438,7 +544,8 @@ foreach ($sheetName in $targetSheets) {
         $anyVariantSucceeded = $false
         foreach ($matchedVariant in $matchedVariants) {
             try {
-                $importResult = Import-ExcelWithFallback -Path $file.FullName -WorksheetName $matchedVariant
+                $forceDedup = $sheetsWithDuplicates.Contains($sheetName)
+                $importResult = Import-ExcelWithFallback -Path $file.FullName -WorksheetName $matchedVariant -MaxStartRow $MaxHeaderRow -ForceDedupHeaders:$forceDedup
                 $sheetData = $importResult.Data
                 $strategy = $importResult.Strategy
 
